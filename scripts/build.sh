@@ -184,13 +184,70 @@ prepare_environment() {
     done
     log_success "Created output subdirectories: bin, docker, archives"
 
+    # 同步 go.mod 中 replace 指向的本地依赖（如 axonhub/llm）
+    # CI 环境 checkout 后 ../axonhub/llm 不存在会导致 go mod tidy 失败
+    sync_local_replaces
+
     log_info "Tidying Go modules..."
-    if ! go mod tidy >/dev/null 2>&1; then
+    if ! go mod tidy 2>&1; then
         log_error "Failed to tidy Go modules"
+        log_error "See go mod tidy output above for details"
         return 1
     fi
 
     log_success "Build environment ready"
+}
+
+# 同步 go.mod 中 replace 指向本地路径的外部依赖
+# 解析 `replace <module> => <相对路径>`，若路径不存在则尝试通过 git clone 拉取
+# 目前仅处理 upstream 的 axonhub/llm：路径形如 ../axonhub/llm，需 clone ../axonhub
+sync_local_replaces() {
+    local go_mod="go.mod"
+    [ -f "$go_mod" ] || return 0
+
+    # 仅提取 replace => ../axonhub/llm 这类本地相对路径条目
+    local line
+    line=$(grep -E '^[[:space:]]*replace[[:space:]]+github\.com/looplj/axonhub/llm[[:space:]]+=>[[:space:]]+\.\./' "$go_mod" 2>/dev/null | head -1)
+    [ -z "$line" ] && return 0
+
+    local path
+    path=$(echo "$line" | awk '{print $4}')   # ../axonhub/llm
+
+    # 路径已就绪
+    if [ -d "$path" ] && [ -f "$path/go.mod" ]; then
+        log_info "Local replace OK: github.com/looplj/axonhub/llm -> $path"
+        return 0
+    fi
+
+    # clone 到 ../axonhub（path 的父目录）
+    local repo_dir
+    repo_dir=$(dirname "$path")   # ../axonhub
+    local repo_url="https://github.com/looplj/axonhub.git"
+
+    log_info "Cloning local replace dependency: github.com/looplj/axonhub/llm"
+    log_info "  from: $repo_url"
+    log_info "  into: $repo_dir"
+
+    if [ -d "$repo_dir/.git" ]; then
+        log_info "  already cloned, updating..."
+        (cd "$repo_dir" && git fetch --all --prune >/dev/null 2>&1 && git pull --ff-only >/dev/null 2>&1) || {
+            log_warning "  failed to update existing clone at $repo_dir"
+        }
+    else
+        if ! git clone --depth 1 "$repo_url" "$repo_dir" >/dev/null 2>&1; then
+            log_error "  failed to clone $repo_url into $repo_dir"
+            log_error "  please manually place the dependency at: $path"
+            return 1
+        fi
+    fi
+
+    # 校验目标路径存在 go.mod
+    if [ ! -f "$path/go.mod" ]; then
+        log_error "  cloned but go.mod not found at expected path: $path"
+        log_error "  check upstream axonhub repo layout (maybe path changed)"
+        return 1
+    fi
+    log_success "Local replace ready: github.com/looplj/axonhub/llm -> $path"
 }
 
 # =============================================================================
